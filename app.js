@@ -147,19 +147,48 @@
     try { return sessionStorage.getItem('bl_session') || ''; } catch (e) { return ''; }
   }
 
-  async function api(action, payload) {
-    if (isDemo()) return Demo.handle(action, payload || {});
-
-    // text/plain keeps this a "simple" request, which Apps Script can answer without a CORS preflight.
+  // text/plain keeps this a "simple" request, which Apps Script can answer without a CORS preflight.
+  async function post(body) {
     const res = await fetch(CONFIG.API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ action: action, payload: payload || {}, sessionToken: sessionToken() }),
+      body: JSON.stringify(body),
       credentials: 'omit'
     });
-    const body = await res.json();
-    if (!body.ok) throw new Error(body.error === 'unauthorized' ? 'Please sign in again.' : (body.error || 'Something went wrong.'));
+    try {
+      return await res.json();
+    } catch (e) {
+      throw new Error('The backend replied with something unexpected. Check API_URL in config.js.');
+    }
+  }
+
+  /** For the login steps, which have no session yet. */
+  async function authCall(action, payload) {
+    const body = await post({ action: action, payload: payload || {}, sessionToken: sessionToken() });
+    if (!body.ok) throw new Error(body.error || 'Something went wrong.');
+    return body.data || {};
+  }
+
+  /** For everything else. Sends you back to the login screen if the session has ended. */
+  async function api(action, payload) {
+    if (isDemo()) return Demo.handle(action, payload || {});
+    const body = await post({ action: action, payload: payload || {}, sessionToken: sessionToken() });
+    if (!body.ok) {
+      if (body.error === 'unauthorized') {
+        setToken('');
+        showLogin('Your session ended. Please sign in again.');
+        throw new Error('Signed out');
+      }
+      throw new Error(body.error || 'Something went wrong.');
+    }
     return body.data;
+  }
+
+  function setToken(token) {
+    try {
+      if (token) sessionStorage.setItem('bl_session', token);
+      else sessionStorage.removeItem('bl_session');
+    } catch (e) { /* private browsing: ignore */ }
   }
 
   async function ensureBoot() {
@@ -942,6 +971,7 @@
             ? '✨ <b>Demo mode.</b> You are seeing sample data. Nothing you enter here is saved. Step 6 connects your real Google Sheet behind a secure login.'
             : '🔒 <b>Connected</b> to your Apps Script backend.'}</p>
           <p class="muted">To add or rename accounts, categories and budgets, edit the tabs in your Google Sheet. Changes show up here and in the Telegram bot automatically.</p>
+          ${isDemo() ? '' : '<div class="actions" style="margin-top:14px"><button type="button" class="btn ghost" id="sign-out">Sign out</button></div>'}
         </section>
       </div>`;
 
@@ -958,6 +988,8 @@
     $('c-bg').addEventListener('input', e => update({ bg: e.target.value }));
     $('c-radius').addEventListener('input', e => update({ radius: Number(e.target.value) }));
     $('c-font').addEventListener('change', e => update({ font: e.target.value }));
+    const signOutBtn = $('sign-out');
+    if (signOutBtn) signOutBtn.addEventListener('click', signOut);
     $('c-reset').addEventListener('click', () => {
       Theme.save(Theme.defaults(Theme.current().preset));
       renderSettings();
@@ -987,10 +1019,98 @@
     }
   }
 
+  /* ======================= login ======================= */
+
+  let loginTicket = null;
+  let googleButtonReady = false;
+
+  function showLogin(message) {
+    state.boot = null;
+    document.querySelector('.app').hidden = true;
+    document.getElementById('login').hidden = false;
+    loginStep('google');
+    loginError(message || '');
+    initGoogleButton();
+  }
+
+  function loginStep(step) {
+    document.getElementById('login-step-google').hidden = step !== 'google';
+    document.getElementById('login-step-code').hidden = step !== 'code';
+    if (step === 'code') setTimeout(() => document.getElementById('login-code').focus(), 60);
+  }
+
+  function loginError(message) {
+    const el = document.getElementById('login-error');
+    el.textContent = message || '';
+    el.hidden = !message;
+  }
+
+  function initGoogleButton() {
+    if (googleButtonReady) return;
+    const gsi = window.google && window.google.accounts && window.google.accounts.id;
+    if (!gsi) { setTimeout(initGoogleButton, 300); return; } // Google's script is still loading
+    gsi.initialize({
+      client_id: CONFIG.GOOGLE_CLIENT_ID,
+      callback: onGoogleSignIn,
+      auto_select: false,
+      cancel_on_tap_outside: true
+    });
+    gsi.renderButton(document.getElementById('google-btn'), { theme: 'outline', size: 'large', shape: 'pill', text: 'signin_with', width: 260 });
+    googleButtonReady = true;
+  }
+
+  async function onGoogleSignIn(response) {
+    loginError('');
+    try {
+      const data = await authCall('auth.google', { idToken: response.credential });
+      loginTicket = data.ticket;
+      document.getElementById('login-hello').textContent = data.name ? `Hi ${data.name}! One more step 🌸` : 'One more step 🌸';
+      loginStep('code');
+    } catch (err) {
+      loginError(err.message);
+    }
+  }
+
+  async function submitCode() {
+    const input = document.getElementById('login-code');
+    const btn = document.getElementById('login-verify');
+    const code = input.value.trim();
+    if (!code) { input.focus(); return; }
+    btn.disabled = true;
+    btn.textContent = 'Checking…';
+    loginError('');
+    try {
+      const data = await authCall('auth.code', { ticket: loginTicket, code: code });
+      setToken(data.sessionToken);
+      input.value = '';
+      loginTicket = null;
+      document.getElementById('login').hidden = true;
+      document.querySelector('.app').hidden = false;
+      router();
+    } catch (err) {
+      loginError(err.message);
+      input.select();
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Unlock 🔓';
+    }
+  }
+
+  async function signOut() {
+    try { await post({ action: 'auth.logout', sessionToken: sessionToken() }); } catch (e) { /* sign out locally anyway */ }
+    setToken('');
+    showLogin('Signed out. See you soon 🌸');
+  }
+
   /* ======================= start ======================= */
 
   Theme.apply(Theme.current());
   document.getElementById('demo-banner').hidden = !isDemo();
   window.addEventListener('hashchange', router);
-  router();
+  document.getElementById('login-verify').addEventListener('click', submitCode);
+  document.getElementById('login-back').addEventListener('click', () => { loginTicket = null; loginStep('google'); loginError(''); });
+  document.getElementById('login-code').addEventListener('keydown', e => { if (e.key === 'Enter') submitCode(); });
+
+  if (isDemo() || sessionToken()) router();
+  else showLogin('');
 })();

@@ -1,11 +1,14 @@
 /* Blossom Ledger · config.js
- * Public settings for the website. Nothing in this file is secret:
- * every visitor can see it, and your backend checks every request anyway.
+ * Public settings for the website. Nothing here is secret: every visitor can see it,
+ * and your backend checks Google sign-in + your authenticator code on every request.
  */
 window.BLOSSOM_CONFIG = {
-  // Step 6: paste your Apps Script web app URL here (the one ending in /exec).
-  API_URL: '',
+  // 1. Your Apps Script web app URL (Script Properties → WEBAPP_URL). It ends in /exec.
+  API_URL: 'PASTE_YOUR_WEB_APP_URL_HERE',
 
-  // Step 6: change to false once login works. While true, the site shows sample data only.
-  DEMO_MODE: true
+  // 2. Your Google Sign-In Client ID (ends in .apps.googleusercontent.com).
+  GOOGLE_CLIENT_ID: 'PASTE_YOUR_CLIENT_ID_HERE',
+
+  // 3. false = real data behind the login. true = sample data, no login.
+  DEMO_MODE: false
 };

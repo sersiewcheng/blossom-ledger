@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src https://script.google.com https://script.googleusercontent.com; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://accounts.google.com/gsi/client; style-src 'self' 'unsafe-inline' https://accounts.google.com/gsi/style; img-src 'self' data: https://*.googleusercontent.com; font-src 'self'; connect-src https://script.google.com https://script.googleusercontent.com https://accounts.google.com/gsi/; frame-src https://accounts.google.com/gsi/; object-src 'none'; base-uri 'none'; form-action 'none'">
   <meta name="referrer" content="no-referrer">
   <meta name="robots" content="noindex, nofollow">
   <title>Blossom Ledger</title>
@@ -11,6 +11,30 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+  <div id="login" class="login" hidden>
+    <div class="login-card">
+      <div class="login-mark">🌸</div>
+      <h1>Blossom Ledger</h1>
+      <p class="muted">Private. Just for you.</p>
+
+      <div id="login-step-google">
+        <div id="google-btn"></div>
+        <p class="login-hint">Sign in with your Google account, then your authenticator code.</p>
+      </div>
+
+      <div id="login-step-code" hidden>
+        <p class="muted" id="login-hello">One more step 🌸</p>
+        <label class="label" for="login-code">6-digit code from your authenticator</label>
+        <input class="input code-input" id="login-code" inputmode="numeric" autocomplete="one-time-code" maxlength="9" placeholder="000000">
+        <button class="btn" type="button" id="login-verify">Unlock 🔓</button>
+        <button class="btn ghost" type="button" id="login-back">Start again</button>
+        <p class="login-hint">Lost your phone? Type one of your recovery codes instead.</p>
+      </div>
+
+      <p class="login-error" id="login-error" hidden></p>
+    </div>
+  </div>
+
   <div id="demo-banner" class="demo-banner" hidden>✨ Demo mode: you're looking at sample data. Your real numbers appear after Step 6.</div>
 
   <div class="app">
@@ -30,6 +54,7 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
   <script src="config.js"></script>
   <script src="app.js"></script>
 </body>
