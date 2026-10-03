@@ -223,6 +223,48 @@ small { font-size: 12.5px; }
 input[type=color] { width: 100%; height: 46px; padding: 4px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); cursor: pointer; }
 input[type=range] { width: 100%; margin-top: 12px; accent-color: var(--primary); }
 
+/* ---------- import ---------- */
+
+.steps { display: grid; gap: 18px; }
+.steps .card h2 { justify-content: flex-start; }
+.step-num {
+  display: inline-grid; place-items: center; width: 26px; height: 26px; margin-right: 10px;
+  border-radius: 50%; background: var(--primary); color: var(--primary-ink);
+  font: 600 13px var(--font-body);
+}
+.dropzone {
+  display: grid; place-items: center; gap: 6px;
+  padding: 26px; margin-bottom: 14px; text-align: center;
+  border: 2px dashed var(--border); border-radius: var(--radius);
+  color: var(--muted); cursor: pointer;
+  transition: border-color .2s, background .2s;
+}
+.dropzone:hover, .dropzone.over { border-color: var(--primary); background: var(--soft); color: var(--text); }
+.dropzone strong { color: var(--text); }
+textarea.input { min-height: 120px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; resize: vertical; }
+.map-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; }
+.table-wrap { overflow-x: auto; margin: 0 -6px; }
+table.rows { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+table.rows th {
+  position: sticky; top: 0; z-index: 1;
+  padding: 8px 6px; text-align: left; white-space: nowrap;
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  font: 600 12px var(--font-body); color: var(--muted); text-transform: uppercase; letter-spacing: .06em;
+}
+table.rows td { padding: 6px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+table.rows tr.skip { opacity: .45; }
+table.rows tr.flag td { background: color-mix(in srgb, var(--warn) 10%, transparent); }
+table.rows .input { padding: 6px 8px; font-size: 13px; border-radius: 10px; }
+table.rows .desc { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+table.rows .num { text-align: right; white-space: nowrap; font-weight: 600; }
+.pill { display: inline-block; padding: 2px 9px; border-radius: 99px; font-size: 12px; background: var(--surface-2); white-space: nowrap; }
+.pill.expense { background: color-mix(in srgb, var(--bad) 16%, transparent); }
+.pill.income { background: color-mix(in srgb, var(--good) 18%, transparent); }
+.pill.transfer { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+.note { font-size: 12px; color: var(--warn); }
+.summary-row { display: flex; flex-wrap: wrap; gap: 18px; margin-bottom: 14px; font-size: 14px; }
+.summary-row b { font-family: var(--font-display); font-size: 18px; display: block; }
+
 /* ---------- login ---------- */
 
 .login {

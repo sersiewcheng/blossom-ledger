@@ -429,6 +429,38 @@
       };
     }
 
+    function demoImportPreview(p) {
+      const account = findByName(db.accounts, p.account) || db.accounts[0];
+      const isCard = String(p.statement_type) === 'card' || account.class === 'Liability';
+      const rows = (p.rows || []).map((raw, i) => {
+        const signed = Number(raw.amount) || 0;
+        const hay = String(raw.description || '').toLowerCase();
+        const kind = isCard ? (signed >= 0 ? 'Expense' : 'Transfer') : (signed >= 0 ? 'Income' : 'Expense');
+        const hit = db.categories.find(c => c.kind === kind && hay && String(c.name).toLowerCase().split(' ')[0] && hay.includes(String(c.name).toLowerCase().split(' ')[0]));
+        const notes = [];
+        if (!hit) notes.push('Pick a category');
+        return {
+          line: i + 1, date: String(raw.date || ''), amount: Math.abs(signed), kind: kind,
+          category: hit ? hit.name : '', account: account.name, to_account: '', merchant: '',
+          description: String(raw.description || ''), raw: String(raw.description || ''),
+          duplicate: false, include: !!hit, needs_review: notes.length > 0, notes: notes
+        };
+      });
+      return {
+        batch_id: 'demo_' + Date.now(), account: account.name, statement_type: isCard ? 'card' : 'bank', rows: rows,
+        summary: { total: rows.length, ready: rows.filter(r => r.include).length, duplicates: 0, needs_review: rows.filter(r => r.needs_review).length }
+      };
+    }
+
+    function demoImportCommit(p) {
+      let imported = 0;
+      (p.rows || []).forEach(r => {
+        if (r.include === false) return;
+        try { addTxn({ amount: r.amount, category: r.category, account: r.account, to_account: r.to_account, merchant: r.merchant, description: r.description, txn_datetime: r.date }); imported++; } catch (e) { /* skip */ }
+      });
+      return { batch_id: p.batch_id, imported: imported, skipped: [], balances: balances() };
+    }
+
     function voidTxn(id) {
       const txn = db.txns.find(t => t.txn_id === id);
       if (!txn) throw new Error('Transaction not found.');
@@ -444,6 +476,10 @@
         case 'getDashboard': return dashboard(p);
         case 'getBudgetStatus': return budgets();
         case 'listTransactions': return list(p);
+        case 'importPreview': return demoImportPreview(p);
+        case 'importCommit': return demoImportCommit(p);
+        case 'undoImportBatch': return { batch_id: p.batch_id, voided: 0, balances: balances() };
+        case 'listImportBatches': return [];
         case 'addTransaction': return addTxn(p);
         case 'voidTransaction': return voidTxn(p.txn_id);
         default: throw new Error('Unknown action: ' + action);
@@ -911,6 +947,436 @@
     }
   }
 
+  /* ======================= page: import ======================= */
+
+  const importState = { headers: [], table: [], mapping: {}, preview: null, result: null };
+
+  /* --- reading a CSV or a block pasted from Excel --- */
+
+  function detectDelimiter(text) {
+    const line = text.split(/\r?\n/).find(l => l.trim()) || '';
+    const counts = { ',': 0, '\t': 0, ';': 0, '|': 0 };
+    let inQuotes = false;
+    for (const ch of line) {
+      if (ch === '"') inQuotes = !inQuotes;
+      else if (!inQuotes && counts[ch] !== undefined) counts[ch]++;
+    }
+    return Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0];
+  }
+
+  function parseDelimited(text, delimiter) {
+    const rows = [];
+    let row = [], field = '', inQuotes = false;
+    const pushField = () => { row.push(field.trim()); field = ''; };
+    const pushRow = () => { if (row.some(c => c !== '')) rows.push(row); row = []; };
+
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (inQuotes) {
+        if (ch === '"' && text[i + 1] === '"') { field += '"'; i++; }
+        else if (ch === '"') inQuotes = false;
+        else field += ch;
+      } else if (ch === '"') inQuotes = true;
+      else if (ch === delimiter) pushField();
+      else if (ch === '\n') { pushField(); pushRow(); }
+      else if (ch !== '\r') field += ch;
+    }
+    pushField();
+    pushRow();
+    return rows;
+  }
+
+  const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+
+  /** Turns a bank's date into YYYY-MM-DD. order is 'dmy', 'mdy' or 'ymd'. */
+  function parseFlexibleDate(value, order) {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    let m = text.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
+    if (m) return `${m[1]}-${pad(+m[2])}-${pad(+m[3])}`;
+    m = text.match(/^(\d{1,2})[-/.\s](\d{1,2})[-/.\s](\d{2,4})/);
+    if (m) {
+      let a = +m[1], b = +m[2];
+      const year = m[3].length === 2 ? 2000 + +m[3] : +m[3];
+      let day = a, month = b;
+      if (order === 'mdy') { day = b; month = a; }
+      if (order === 'auto' && a <= 12 && b > 12) { day = b; month = a; }
+      if (month > 12) { const t = day; day = month; month = t; }
+      return `${year}-${pad(month)}-${pad(day)}`;
+    }
+    m = text.match(/^(\d{1,2})[-\s]([A-Za-z]{3,})[-\s](\d{2,4})/);
+    if (m) {
+      const month = MONTHS[m[2].slice(0, 3).toLowerCase()];
+      const year = m[3].length === 2 ? 2000 + +m[3] : +m[3];
+      if (month) return `${year}-${pad(month)}-${pad(+m[1])}`;
+    }
+    m = text.match(/^([A-Za-z]{3,})[-\s](\d{1,2})[,\s]+(\d{2,4})/);
+    if (m) {
+      const month = MONTHS[m[1].slice(0, 3).toLowerCase()];
+      const year = m[3].length === 2 ? 2000 + +m[3] : +m[3];
+      if (month) return `${year}-${pad(month)}-${pad(+m[2])}`;
+    }
+    const d = new Date(text);
+    return isNaN(d.getTime()) ? '' : ymd(d);
+  }
+
+  /** Turns "1,234.50", "(45.00)" or "45.00 DR" into a signed number. */
+  function parseAmount(value) {
+    let text = String(value == null ? '' : value).trim();
+    if (!text) return null;
+    let sign = 1;
+    if (/^\(.*\)$/.test(text)) { sign = -1; text = text.slice(1, -1); }
+    if (/\bdr\b|\bdebit\b/i.test(text)) sign = -1;
+    if (/\bcr\b|\bcredit\b/i.test(text)) sign = 1;
+    if (text.trim().startsWith('-')) sign = -1;
+    const n = parseFloat(text.replace(/[^0-9.]/g, ''));
+    return isFinite(n) ? sign * Math.abs(n) : null;
+  }
+
+  function guessColumn(headers, patterns) {
+    for (const pattern of patterns) {
+      const i = headers.findIndex(h => pattern.test(h));
+      if (i !== -1) return String(i);
+    }
+    return '';
+  }
+
+  function autoMap(headers, table) {
+    const map = {
+      date: guessColumn(headers, [/transaction\s*date/i, /posting\s*date/i, /value\s*date/i, /^date/i, /date/i]),
+      out: guessColumn(headers, [/withdraw/i, /debit\s*amount/i, /money\s*out/i, /paid\s*out/i, /^debit/i]),
+      in: guessColumn(headers, [/deposit/i, /credit\s*amount/i, /money\s*in/i, /paid\s*in/i, /^credit/i]),
+      amount: guessColumn(headers, [/^amount/i, /transaction\s*amount/i, /amount/i]),
+      dateOrder: 'dmy',
+      flip: false
+    };
+
+    // The description is whichever spare column holds the most actual words
+    // (bank files often have both a short code column and the merchant name).
+    const used = [map.date, map.out, map.in, map.amount].filter(v => v !== '').map(Number);
+    const namePattern = /description|particular|narrative|detail|remark|merchant|payee|ref/i;
+    let best = { index: '', score: -1 };
+    headers.forEach((header, i) => {
+      if (used.indexOf(i) !== -1) return;
+      const values = (table || []).slice(0, 25).map(r => String(r[i] || '').trim()).filter(v => v);
+      if (!values.length) return;
+      const wordy = values.filter(v => /[a-z]{3,}/i.test(v)).length / values.length;
+      const avgLength = values.reduce((sum, v) => sum + v.length, 0) / values.length;
+      const score = avgLength * wordy + (namePattern.test(header) ? 8 : 0);
+      if (score > best.score) best = { index: String(i), score: score };
+    });
+    map.description = best.index !== '' ? best.index
+      : guessColumn(headers, [/description/i, /particular/i, /narrative/i, /detail/i, /reference/i, /remark/i, /merchant/i, /payee/i]);
+    return map;
+  }
+
+  function readTable(text) {
+    const delimiter = detectDelimiter(text);
+    const rows = parseDelimited(text, delimiter).filter(r => r.length > 1);
+    if (!rows.length) throw new Error("I couldn't find any rows in that.");
+    // The header row is the first one that has no parsable amount in it.
+    let headerIndex = 0;
+    for (let i = 0; i < Math.min(rows.length, 15); i++) {
+      const numbers = rows[i].filter(c => parseAmount(c) !== null && /\d/.test(c)).length;
+      if (numbers === 0 && rows[i].filter(c => c).length >= 2) { headerIndex = i; break; }
+    }
+    importState.headers = rows[headerIndex].map((h, i) => h || `Column ${i + 1}`);
+    importState.table = rows.slice(headerIndex + 1).filter(r => r.some(c => c !== ''));
+    importState.mapping = autoMap(importState.headers, importState.table);
+    importState.preview = null;
+    importState.result = null;
+  }
+
+  function mappedRows() {
+    const m = importState.mapping;
+    const cell = (row, key) => (m[key] === '' || m[key] == null ? '' : (row[Number(m[key])] || ''));
+    return importState.table.map(row => {
+      let amount = null;
+      if (m.out !== '' || m.in !== '') {
+        const out = parseAmount(cell(row, 'out'));
+        const income = parseAmount(cell(row, 'in'));
+        if (out) amount = -Math.abs(out);
+        else if (income) amount = Math.abs(income);
+      }
+      if (amount === null) amount = parseAmount(cell(row, 'amount'));
+      if (amount === null) amount = 0;
+      if (m.flip) amount = -amount;
+      return {
+        date: parseFlexibleDate(cell(row, 'date'), m.dateOrder),
+        description: String(cell(row, 'description') || '').replace(/\s+/g, ' ').trim(),
+        amount: amount
+      };
+    }).filter(r => r.date || r.amount);
+  }
+
+  /* --- the page --- */
+
+  function renderImport() {
+    const accounts = state.boot.accounts.filter(a => a.is_active !== false);
+    view.innerHTML = `
+      <div class="page-head fade-in">
+        <div><h1>Import 📥</h1><p>Bring in a bank or card statement. Nothing is saved until you check the preview.</p></div>
+      </div>
+
+      <div class="steps fade-in">
+        <section class="card">
+          <h2><span class="step-num">1</span>Which account?</h2>
+          <div class="row2">
+            <div class="field"><label for="i-account">Statement account</label>
+              <select class="input" id="i-account">${accounts.map(a =>
+                `<option value="${esc(a.name)}">${esc(a.icon || '')} ${esc(a.name)}</option>`).join('')}</select></div>
+            <div class="field"><label for="i-type">Statement type</label>
+              <select class="input" id="i-type">
+                <option value="bank">Bank account (minus = money out)</option>
+                <option value="card">Credit card (plus = a charge)</option>
+              </select></div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2><span class="step-num">2</span>Your rows</h2>
+          <div class="dropzone" id="i-drop">
+            <strong>Drop a CSV here, or click to choose a file</strong>
+            <span>Exported from your bank. Excel files: open in Google Sheets → File → Download → CSV</span>
+          </div>
+          <input type="file" id="i-file" accept=".csv,.txt,text/csv" hidden>
+          <div class="field"><label for="i-paste">…or paste rows copied from Excel</label>
+            <textarea class="input" id="i-paste" placeholder="Date	Description	Amount
+01/10/2026	STARBUCKS	-6.50"></textarea></div>
+          <div class="actions"><button class="btn" type="button" id="i-read">Read rows</button></div>
+        </section>
+
+        <section class="card" id="i-map-card" hidden>
+          <h2><span class="step-num">3</span>Check the columns</h2>
+          <div class="map-grid" id="i-map"></div>
+          <p class="muted" id="i-sample" style="margin-top:14px"></p>
+          <div class="actions" style="margin-top:14px"><button class="btn" type="button" id="i-preview">Preview rows</button></div>
+        </section>
+
+        <section class="card" id="i-review-card" hidden>
+          <h2><span class="step-num">4</span>Review and import</h2>
+          <div id="i-review"></div>
+        </section>
+
+        <section class="card" id="i-result-card" hidden>
+          <h2>Result</h2>
+          <div id="i-result"></div>
+        </section>
+      </div>`;
+
+    const $ = id => document.getElementById(id);
+
+    const defaultType = () => {
+      const account = findByName(state.boot.accounts, $('i-account').value);
+      $('i-type').value = account && account['class'] === 'Liability' ? 'card' : 'bank';
+    };
+    defaultType();
+    $('i-account').addEventListener('change', defaultType);
+
+    $('i-drop').addEventListener('click', () => $('i-file').click());
+    $('i-drop').addEventListener('dragover', e => { e.preventDefault(); $('i-drop').classList.add('over'); });
+    $('i-drop').addEventListener('dragleave', () => $('i-drop').classList.remove('over'));
+    $('i-drop').addEventListener('drop', e => {
+      e.preventDefault();
+      $('i-drop').classList.remove('over');
+      const file = e.dataTransfer.files && e.dataTransfer.files[0];
+      if (file) loadFile(file);
+    });
+    $('i-file').addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+
+    function loadFile(file) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        $('i-paste').value = String(reader.result || '').slice(0, 400000);
+        toast(`Read ${esc(file.name)} 🌸`);
+        readAndShowMapping();
+      };
+      reader.onerror = () => toast("😿 I couldn't read that file.");
+      reader.readAsText(file);
+    }
+
+    $('i-read').addEventListener('click', readAndShowMapping);
+
+    function readAndShowMapping() {
+      try {
+        const text = $('i-paste').value.trim();
+        if (!text) { toast('Paste some rows or choose a file first 🌷'); return; }
+        readTable(text);
+        renderMapping();
+        $('i-map-card').hidden = false;
+        $('i-review-card').hidden = true;
+        $('i-result-card').hidden = true;
+        $('i-map-card').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } catch (err) {
+        toast('😿 ' + err.message);
+      }
+    }
+
+    function renderMapping() {
+      const m = importState.mapping;
+      const options = (selected, allowBlank) =>
+        (allowBlank ? '<option value="">— none —</option>' : '') +
+        importState.headers.map((h, i) => `<option value="${i}" ${String(i) === String(selected) ? 'selected' : ''}>${esc(h)}</option>`).join('');
+
+      $('i-map').innerHTML = `
+        <div class="field"><label for="m-date">Date column</label><select class="input" id="m-date" data-map="date">${options(m.date, false)}</select></div>
+        <div class="field"><label for="m-desc">Description column</label><select class="input" id="m-desc" data-map="description">${options(m.description, false)}</select></div>
+        <div class="field"><label for="m-amount">Amount column</label><select class="input" id="m-amount" data-map="amount">${options(m.amount, true)}</select></div>
+        <div class="field"><label for="m-out">Money out column</label><select class="input" id="m-out" data-map="out">${options(m.out, true)}</select></div>
+        <div class="field"><label for="m-in">Money in column</label><select class="input" id="m-in" data-map="in">${options(m.in, true)}</select></div>
+        <div class="field"><label for="m-order">Date format</label>
+          <select class="input" id="m-order" data-map="dateOrder">
+            <option value="dmy" ${m.dateOrder === 'dmy' ? 'selected' : ''}>Day first (31/12/2026)</option>
+            <option value="mdy" ${m.dateOrder === 'mdy' ? 'selected' : ''}>Month first (12/31/2026)</option>
+            <option value="ymd" ${m.dateOrder === 'ymd' ? 'selected' : ''}>Year first (2026-12-31)</option>
+          </select></div>
+        <div class="field"><label for="m-flip">Signs</label>
+          <select class="input" id="m-flip" data-map="flip">
+            <option value="no" ${m.flip ? '' : 'selected'}>As in the file</option>
+            <option value="yes" ${m.flip ? 'selected' : ''}>Flip them (+ and − are swapped)</option>
+          </select></div>`;
+
+      $('i-map').querySelectorAll('[data-map]').forEach(el => el.addEventListener('change', () => {
+        const key = el.dataset.map;
+        importState.mapping[key] = key === 'flip' ? el.value === 'yes' : el.value;
+        showSample();
+      }));
+      showSample();
+    }
+
+    function showSample() {
+      const rows = mappedRows();
+      const first = rows[0];
+      $('i-sample').innerHTML = !first
+        ? '⚠️ I could not read any rows with these columns. Try different ones.'
+        : `${rows.length} row(s) found. First one reads as: <b>${esc(first.date || '❓ no date')}</b> · ${esc(first.description || '❓ no description')} · <b>${esc(money(first.amount))}</b> ${first.amount < 0 ? '(money out)' : '(money in)'}`;
+    }
+
+    $('i-preview').addEventListener('click', async () => {
+      const rows = mappedRows();
+      if (!rows.length) { toast('No rows to preview 🌷'); return; }
+      const btn = $('i-preview');
+      btn.disabled = true; btn.textContent = 'Checking…';
+      try {
+        importState.preview = await api('importPreview', {
+          rows: rows.slice(0, 500),
+          account: $('i-account').value,
+          statement_type: $('i-type').value
+        });
+        renderReview();
+        $('i-review-card').hidden = false;
+        $('i-review-card').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } catch (err) {
+        toast('😿 ' + err.message);
+      } finally {
+        btn.disabled = false; btn.textContent = 'Preview rows';
+      }
+    });
+
+    function renderReview() {
+      const preview = importState.preview;
+      const accounts = state.boot.accounts.filter(a => a.is_active !== false);
+      const categories = state.boot.categories.filter(c => c.is_active !== false && c.kind);
+      const accountOptions = (selected, blank) => (blank ? '<option value="">—</option>' : '') +
+        accounts.map(a => `<option ${a.name === selected ? 'selected' : ''}>${esc(a.name)}</option>`).join('');
+      const categoryOptions = selected => '<option value="">— pick —</option>' +
+        ['Expense', 'Income', 'Transfer'].map(kind => {
+          const list = categories.filter(c => c.kind === kind);
+          return !list.length ? '' : `<optgroup label="${kind}">` + list.map(c =>
+            `<option ${c.name === selected ? 'selected' : ''}>${esc(c.name)}</option>`).join('') + '</optgroup>';
+        }).join('');
+
+      document.getElementById('i-review').innerHTML = `
+        <div class="summary-row">
+          <div><span class="muted">Rows</span><b>${preview.summary.total}</b></div>
+          <div><span class="muted">Ready</span><b class="pos">${preview.summary.ready}</b></div>
+          <div><span class="muted">Need a look</span><b>${preview.summary.needs_review}</b></div>
+          <div><span class="muted">Duplicates</span><b>${preview.summary.duplicates}</b></div>
+        </div>
+        <div class="table-wrap">
+          <table class="rows">
+            <thead><tr>
+              <th><input type="checkbox" id="i-all" title="Select all"></th>
+              <th>Date</th><th>Description</th><th>Amount</th><th>Type</th><th>Category</th><th>Account</th><th>To</th><th></th>
+            </tr></thead>
+            <tbody>${preview.rows.map(r => `
+              <tr data-line="${r.line}" class="${r.include ? '' : 'skip'} ${r.needs_review || r.duplicate ? 'flag' : ''}">
+                <td><input type="checkbox" data-field="include" ${r.include ? 'checked' : ''}></td>
+                <td><input class="input" style="width:120px" data-field="date" value="${esc(r.date)}"></td>
+                <td class="desc" title="${esc(r.description)}">${esc(r.description)}</td>
+                <td class="num">${esc(money(r.amount))}</td>
+                <td><span class="pill ${esc(String(r.kind).toLowerCase())}">${esc(r.kind)}</span></td>
+                <td><select class="input" data-field="category">${categoryOptions(r.category)}</select></td>
+                <td><select class="input" data-field="account">${accountOptions(r.account, true)}</select></td>
+                <td>${r.kind === 'Transfer' ? `<select class="input" data-field="to_account">${accountOptions(r.to_account, true)}</select>` : ''}</td>
+                <td>${r.duplicate ? '<span class="note">duplicate</span>' : r.notes.length ? `<span class="note">${esc(r.notes.join(', '))}</span>` : '✅'}</td>
+              </tr>`).join('')}</tbody>
+          </table>
+        </div>
+        <div class="actions" style="margin-top:16px">
+          <button class="btn" type="button" id="i-commit">Import selected rows</button>
+          <button class="btn ghost" type="button" id="i-cancel">Cancel</button>
+        </div>`;
+
+      const table = document.querySelector('#i-review table.rows');
+      table.addEventListener('change', e => {
+        const field = e.target.dataset.field;
+        if (!field) return;
+        const tr = e.target.closest('tr');
+        const row = preview.rows.find(r => String(r.line) === tr.dataset.line);
+        if (!row) return;
+        row[field] = field === 'include' ? e.target.checked : e.target.value;
+        if (field !== 'include') { row.include = true; tr.querySelector('[data-field="include"]').checked = true; }
+        tr.classList.toggle('skip', !row.include);
+      });
+      document.getElementById('i-all').addEventListener('change', e => {
+        preview.rows.forEach(r => { r.include = e.target.checked; });
+        table.querySelectorAll('[data-field="include"]').forEach(box => { box.checked = e.target.checked; });
+        table.querySelectorAll('tbody tr').forEach(tr => tr.classList.toggle('skip', !e.target.checked));
+      });
+      document.getElementById('i-cancel').addEventListener('click', () => { document.getElementById('i-review-card').hidden = true; });
+      document.getElementById('i-commit').addEventListener('click', commit);
+    }
+
+    async function commit() {
+      const preview = importState.preview;
+      const chosen = preview.rows.filter(r => r.include).length;
+      if (!chosen) { toast('Tick at least one row 🌷'); return; }
+      if (!window.confirm(`Import ${chosen} transaction(s) into your Sheet?`)) return;
+
+      const btn = document.getElementById('i-commit');
+      btn.disabled = true; btn.textContent = 'Importing…';
+      try {
+        const result = await api('importCommit', { batch_id: preview.batch_id, rows: preview.rows });
+        importState.result = result;
+        document.getElementById('i-result').innerHTML = `
+          <p>✅ Imported <b>${result.imported}</b> transaction(s).</p>
+          ${result.skipped.length ? `<p class="muted">Skipped ${result.skipped.length}:</p><ul class="muted">${
+            result.skipped.slice(0, 20).map(s => `<li>Row ${esc(s.line)} — ${esc(s.reason)}</li>`).join('')}</ul>` : ''}
+          <div class="actions" style="margin-top:12px">
+            <button class="btn ghost" type="button" id="i-undo">↩️ Undo this import</button>
+            <a class="btn" href="#/dashboard">See the dashboard</a>
+          </div>`;
+        document.getElementById('i-result-card').hidden = false;
+        document.getElementById('i-review-card').hidden = true;
+        document.getElementById('i-result-card').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        document.getElementById('i-undo').addEventListener('click', async () => {
+          if (!window.confirm('Undo this whole import? Every row from it is marked void.')) return;
+          try {
+            const undone = await api('undoImportBatch', { batch_id: result.batch_id });
+            toast(`↩️ Undone — ${undone.voided} row(s) voided.`);
+            document.getElementById('i-result-card').hidden = true;
+          } catch (err) { toast('😿 ' + err.message); }
+        });
+        toast(`Imported ${result.imported} 🌸`);
+      } catch (err) {
+        toast('😿 ' + err.message);
+      } finally {
+        btn.disabled = false; btn.textContent = 'Import selected rows';
+      }
+    }
+  }
+
   /* ======================= page: settings ======================= */
 
   function renderSettings() {
@@ -999,7 +1465,7 @@
 
   /* ======================= router ======================= */
 
-  const ROUTES = { dashboard: renderDashboard, add: renderAdd, transactions: renderTransactions, settings: renderSettings };
+  const ROUTES = { dashboard: renderDashboard, add: renderAdd, transactions: renderTransactions, import: renderImport, settings: renderSettings };
 
   function showError(err) {
     view.innerHTML = `<div class="card empty">😿 ${esc(err && err.message ? err.message : err)}</div>`;
