@@ -24,6 +24,8 @@
     ['all_time', 'All time']
   ];
 
+  const NO_SPEND_TYPES = ['Fixed Deposit'];
+
   const PALETTE = ['#e58fae', '#b9a3dc', '#f2b68f', '#8fc9b3', '#f5d38a', '#9bb7d4', '#e7a3c9', '#c7b299', '#a9d6e5', '#f0a3a3'];
 
   /* ======================= small helpers ======================= */
@@ -803,11 +805,31 @@
       Transfer: ['Moving from', '🔁 This moves money between your own accounts. It is not counted as spending.']
     };
 
+    /** Money in a fixed deposit is locked: you can move it or earn interest, but not spend it. */
+    function applyAccountRules(kind) {
+      const select = $('f-account');
+      let blockedAny = false;
+      Array.from(select.options).forEach(option => {
+        const account = findByName(state.boot.accounts, option.value);
+        const blocked = kind === 'Expense' && account && NO_SPEND_TYPES.indexOf(account.type) !== -1;
+        option.disabled = blocked;
+        if (blocked) blockedAny = true;
+      });
+      if (select.selectedOptions[0] && select.selectedOptions[0].disabled) {
+        const firstAllowed = Array.from(select.options).find(o => !o.disabled);
+        if (firstAllowed) select.value = firstAllowed.value;
+      }
+      return blockedAny;
+    }
+
     function select(chip) {
       document.querySelectorAll('[data-cat]').forEach(c => c.classList.toggle('on', c === chip));
       selected = chip ? { name: chip.dataset.cat, kind: chip.dataset.kind } : null;
       const note = selected ? NOTES[selected.kind] : null;
-      $('kind-note').innerHTML = note ? note[1] : 'Pick a category to begin ✨';
+      const locked = applyAccountRules(selected ? selected.kind : '');
+      $('kind-note').innerHTML = note
+        ? note[1] + (locked ? ' <span class="muted">Fixed deposits can\'t be spent from, so they\'re greyed out.</span>' : '')
+        : 'Pick a category to begin ✨';
       $('account-label').textContent = note ? note[0] : 'Paid from';
       $('to-wrap').hidden = !selected || selected.kind !== 'Transfer';
       $('merchant-wrap').hidden = !!selected && selected.kind === 'Transfer';
@@ -848,6 +870,11 @@
       try {
         const result = await api('addTransaction', payload);
         save('bl_last_account', payload.account);
+        if (payload.merchant && !findByName(state.boot.merchants, payload.merchant)) {
+          state.boot.merchants.push({ name: payload.merchant });
+          const list = document.getElementById('merchant-list');
+          if (list) list.insertAdjacentHTML('beforeend', `<option value="${esc(payload.merchant)}"></option>`);
+        }
         const bal = result.account_balance;
         const balText = bal ? ` · ${bal.name}: ${money(bal.balance, bal.currency)}${bal.class === 'Liability' ? ' owed' : ''}` : '';
         toast(`Saved ✨${balText}`, 'Undo', async () => {
@@ -1185,6 +1212,10 @@
     $('i-file').addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
 
     function loadFile(file) {
+      if (/\.(xlsx|xls|numbers|pdf)$/i.test(file.name)) {
+        toast('That\'s a spreadsheet file, not a CSV. Open it in Google Sheets → File → Download → CSV, then try again.');
+        return;
+      }
       const reader = new FileReader();
       reader.onload = () => {
         $('i-paste').value = String(reader.result || '').slice(0, 400000);
@@ -1301,14 +1332,14 @@
             </tr></thead>
             <tbody>${preview.rows.map(r => `
               <tr data-line="${r.line}" class="${r.include ? '' : 'skip'} ${r.needs_review || r.duplicate ? 'flag' : ''}">
-                <td><input type="checkbox" data-field="include" ${r.include ? 'checked' : ''}></td>
-                <td><input class="input" style="width:120px" data-field="date" value="${esc(r.date)}"></td>
+                <td><input type="checkbox" data-field="include" aria-label="Include row ${r.line}" ${r.include ? 'checked' : ''}></td>
+                <td><input class="input" style="width:120px" data-field="date" aria-label="Date" value="${esc(r.date)}"></td>
                 <td class="desc" title="${esc(r.description)}">${esc(r.description)}</td>
                 <td class="num">${esc(money(r.amount))}</td>
                 <td><span class="pill ${esc(String(r.kind).toLowerCase())}">${esc(r.kind)}</span></td>
-                <td><select class="input" data-field="category">${categoryOptions(r.category)}</select></td>
-                <td><select class="input" data-field="account">${accountOptions(r.account, true)}</select></td>
-                <td>${r.kind === 'Transfer' ? `<select class="input" data-field="to_account">${accountOptions(r.to_account, true)}</select>` : ''}</td>
+                <td><select class="input" data-field="category" aria-label="Category">${categoryOptions(r.category)}</select></td>
+                <td><select class="input" data-field="account" aria-label="Account">${accountOptions(r.account, true)}</select></td>
+                <td>${r.kind === 'Transfer' ? `<select class="input" data-field="to_account" aria-label="Transfer to">${accountOptions(r.to_account, true)}</select>` : ''}</td>
                 <td>${r.duplicate ? '<span class="note">duplicate</span>' : r.notes.length ? `<span class="note">${esc(r.notes.join(', '))}</span>` : '✅'}</td>
               </tr>`).join('')}</tbody>
           </table>
@@ -1340,14 +1371,36 @@
 
     async function commit() {
       const preview = importState.preview;
-      const chosen = preview.rows.filter(r => r.include).length;
-      if (!chosen) { toast('Tick at least one row 🌷'); return; }
-      if (!window.confirm(`Import ${chosen} transaction(s) into your Sheet?`)) return;
+      const selected = preview.rows.filter(r => r.include);
+      if (!selected.length) { toast('Tick at least one row 🌷'); return; }
+
+      const badDates = selected.filter(r => !/^\d{4}-\d{2}-\d{2}$/.test(String(r.date || '')));
+      if (badDates.length) {
+        toast(`${badDates.length} row(s) have a date I can't read (use YYYY-MM-DD). Fix or untick them.`);
+        badDates.forEach(r => {
+          const tr = document.querySelector(`tr[data-line="${r.line}"]`);
+          if (tr) tr.classList.add('flag');
+        });
+        return;
+      }
+      if (!window.confirm(`Import ${selected.length} transaction(s) into your Sheet?`)) return;
 
       const btn = document.getElementById('i-commit');
-      btn.disabled = true; btn.textContent = 'Importing…';
+      btn.disabled = true;
       try {
-        const result = await api('importCommit', { batch_id: preview.batch_id, rows: preview.rows });
+        // Sent in chunks so a big statement can't hit the backend's time limit.
+        const CHUNK = 100;
+        let imported = 0;
+        const skipped = [];
+        for (let i = 0; i < selected.length; i += CHUNK) {
+          btn.textContent = selected.length > CHUNK
+            ? `Importing ${Math.min(i + CHUNK, selected.length)} of ${selected.length}…`
+            : 'Importing…';
+          const part = await api('importCommit', { batch_id: preview.batch_id, rows: selected.slice(i, i + CHUNK) });
+          imported += part.imported;
+          (part.skipped || []).forEach(x => skipped.push(x));
+        }
+        const result = { batch_id: preview.batch_id, imported: imported, skipped: skipped };
         importState.result = result;
         document.getElementById('i-result').innerHTML = `
           <p>✅ Imported <b>${result.imported}</b> transaction(s).</p>
