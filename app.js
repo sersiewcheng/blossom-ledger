@@ -1047,6 +1047,18 @@
     return isNaN(d.getTime()) ? '' : ymd(d);
   }
 
+  /** True only for things that really look like money: 1,234.50 · (45.00) · 45.00 DR */
+  function looksLikeAmount(value) {
+    return /^[-+(]?\s*[$€£¥₹]?\s*\d[\d,]*(\.\d+)?\s*\)?\s*(cr|dr)?$/i.test(String(value == null ? '' : value).trim());
+  }
+
+  /** True for 20-Oct-26, 31/12/2026, 2026-12-31 and friends. */
+  function looksLikeDate(value) {
+    const text = String(value == null ? '' : value).trim();
+    if (!/[-/.]|[a-z]{3}/i.test(text)) return false;
+    return !!parseFlexibleDate(text, 'dmy');
+  }
+
   /** Turns "1,234.50", "(45.00)" or "45.00 DR" into a signed number. */
   function parseAmount(value) {
     let text = String(value == null ? '' : value).trim();
@@ -1068,6 +1080,27 @@
     return '';
   }
 
+  function columnStats(table, index) {
+    const values = table.slice(0, 40).map(r => String(r[index] || '').trim()).filter(v => v);
+    if (!values.length) return { dates: 0, amounts: 0, text: 0 };
+    return {
+      dates: values.filter(looksLikeDate).length / values.length,
+      amounts: values.filter(looksLikeAmount).length / values.length,
+      text: (values.filter(v => /[a-z]{3,}/i.test(v)).length / values.length) *
+            (values.reduce((sum, v) => sum + v.length, 0) / values.length)
+    };
+  }
+
+  function bestColumn(headers, table, score, used) {
+    let best = { index: '', score: 0 };
+    headers.forEach((header, i) => {
+      if (used.indexOf(String(i)) !== -1) return;
+      const value = score(columnStats(table, i), header);
+      if (value > best.score) best = { index: String(i), score: value };
+    });
+    return best.index;
+  }
+
   function autoMap(headers, table) {
     const map = {
       date: guessColumn(headers, [/transaction\s*date/i, /posting\s*date/i, /value\s*date/i, /^date/i, /date/i]),
@@ -1078,22 +1111,21 @@
       flip: false
     };
 
-    // The description is whichever spare column holds the most actual words
+    // Fall back to looking at the values when the headers don't say (or there are none).
+    const rows = table || [];
+    if (map.date === '') map.date = bestColumn(headers, rows, st => st.dates, []);
+    if (map.amount === '' && map.out === '' && map.in === '') {
+      map.amount = bestColumn(headers, rows, st => st.amounts, [map.date]);
+    }
+
+    // The description is the spare column with the most actual words
     // (bank files often have both a short code column and the merchant name).
-    const used = [map.date, map.out, map.in, map.amount].filter(v => v !== '').map(Number);
+    const used = [map.date, map.out, map.in, map.amount].filter(v => v !== '');
     const namePattern = /description|particular|narrative|detail|remark|merchant|payee|ref/i;
-    let best = { index: '', score: -1 };
-    headers.forEach((header, i) => {
-      if (used.indexOf(i) !== -1) return;
-      const values = (table || []).slice(0, 25).map(r => String(r[i] || '').trim()).filter(v => v);
-      if (!values.length) return;
-      const wordy = values.filter(v => /[a-z]{3,}/i.test(v)).length / values.length;
-      const avgLength = values.reduce((sum, v) => sum + v.length, 0) / values.length;
-      const score = avgLength * wordy + (namePattern.test(header) ? 8 : 0);
-      if (score > best.score) best = { index: String(i), score: score };
-    });
-    map.description = best.index !== '' ? best.index
-      : guessColumn(headers, [/description/i, /particular/i, /narrative/i, /detail/i, /reference/i, /remark/i, /merchant/i, /payee/i]);
+    map.description = bestColumn(headers, rows, (st, header) => st.text + (namePattern.test(header) ? 8 : 0), used);
+    if (map.description === '') {
+      map.description = guessColumn(headers, [/description/i, /particular/i, /narrative/i, /detail/i, /reference/i, /remark/i, /merchant/i, /payee/i]);
+    }
     return map;
   }
 
@@ -1101,22 +1133,32 @@
     const delimiter = detectDelimiter(text);
     const rows = parseDelimited(text, delimiter).filter(r => r.length > 1);
     if (!rows.length) throw new Error("I couldn't find any rows in that.");
-    // The header row is the first one that has no parsable amount in it.
-    let headerIndex = 0;
-    for (let i = 0; i < Math.min(rows.length, 15); i++) {
-      const numbers = rows[i].filter(c => parseAmount(c) !== null && /\d/.test(c)).length;
-      if (numbers === 0 && rows[i].filter(c => c).length >= 2) { headerIndex = i; break; }
-    }
-    importState.headers = rows[headerIndex].map((h, i) => h || `Column ${i + 1}`);
-    importState.table = rows.slice(headerIndex + 1).filter(r => r.some(c => c !== ''));
+
+    // A data row has both a date and an amount in it. The header row, if there is one,
+    // is the last row of text before the data starts.
+    const isDataRow = row => row.some(looksLikeDate) && row.some(looksLikeAmount);
+    let firstData = rows.findIndex(isDataRow);
+    if (firstData === -1) firstData = 1;             // no obvious data: assume row 1 is a header
+
+    const hasHeader = firstData > 0 && !isDataRow(rows[firstData - 1]) && rows[firstData - 1].filter(c => c).length >= 2;
+    const width = Math.max.apply(null, rows.map(r => r.length));
+
+    importState.headers = hasHeader
+      ? rows[firstData - 1].map((h, i) => h || `Column ${i + 1}`)
+      : Array.from({ length: width }, (_, i) => `Column ${i + 1}`);
+    importState.table = rows.slice(hasHeader ? firstData : Math.max(firstData, 0)).filter(r => r.some(c => c !== ''));
+    importState.hasHeader = hasHeader;
     importState.mapping = autoMap(importState.headers, importState.table);
     importState.preview = null;
     importState.result = null;
   }
 
+  const DIRECTION_WORD = /^(expense|spend|spent|debit|dr|withdrawal|out|income|credit|cr|deposit|in|transfer)\b[\s:.\-–]*/i;
+
   function mappedRows() {
     const m = importState.mapping;
     const cell = (row, key) => (m[key] === '' || m[key] == null ? '' : (row[Number(m[key])] || ''));
+
     return importState.table.map(row => {
       let amount = null;
       if (m.out !== '' || m.in !== '') {
@@ -1127,12 +1169,20 @@
       }
       if (amount === null) amount = parseAmount(cell(row, 'amount'));
       if (amount === null) amount = 0;
+
+      // Some exports put the direction in words instead of a minus sign,
+      // e.g. "Expense Pay america express".
+      let description = String(cell(row, 'description') || '').replace(/\s+/g, ' ').trim();
+      const word = description.match(DIRECTION_WORD);
+      if (word) {
+        description = description.slice(word[0].length).trim();
+        const direction = word[1].toLowerCase();
+        const moneyIn = ['income', 'credit', 'cr', 'deposit', 'in'].indexOf(direction) !== -1;
+        amount = moneyIn ? Math.abs(amount) : -Math.abs(amount);
+      }
+
       if (m.flip) amount = -amount;
-      return {
-        date: parseFlexibleDate(cell(row, 'date'), m.dateOrder),
-        description: String(cell(row, 'description') || '').replace(/\s+/g, ' ').trim(),
-        amount: amount
-      };
+      return { date: parseFlexibleDate(cell(row, 'date'), m.dateOrder), description: description, amount: amount };
     }).filter(r => r.date || r.amount);
   }
 
@@ -1279,8 +1329,10 @@
       const rows = mappedRows();
       const first = rows[0];
       $('i-sample').innerHTML = !first
-        ? '⚠️ I could not read any rows with these columns. Try different ones.'
-        : `${rows.length} row(s) found. First one reads as: <b>${esc(first.date || '❓ no date')}</b> · ${esc(first.description || '❓ no description')} · <b>${esc(money(first.amount))}</b> ${first.amount < 0 ? '(money out)' : '(money in)'}`;
+        ? '⚠️ I could not read any rows with these columns. Check the Date and Amount dropdowns above.'
+        : `${rows.length} row(s) found${importState.hasHeader ? '' : ' (no header row — using Column 1, 2, 3…)'}. ` +
+          `First one reads as: <b>${esc(first.date || '❓ no date')}</b> · ${esc(first.description || '❓ no description')} · ` +
+          `<b>${esc(money(Math.abs(first.amount)))}</b> ${first.amount < 0 ? '→ money out 💸' : '→ money in 💰'}`;
     }
 
     $('i-preview').addEventListener('click', async () => {
