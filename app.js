@@ -9,6 +9,7 @@
   const view = document.getElementById('view');
 
   const state = {
+    backend: null,
     boot: null,
     period: 'this_month',
     breakdown: 'category',
@@ -181,6 +182,9 @@
         showLogin('Your session ended. Please sign in again.');
         throw new Error('Signed out');
       }
+      if (body.error === 'unknown_action') {
+        throw new Error(`The backend doesn't know "${action}" yet. Publish it: Apps Script → Deploy → Manage deployments → ✏️ → Version: New version → Deploy.`);
+      }
       throw new Error(body.error || 'Something went wrong.');
     }
     return body.data;
@@ -193,8 +197,25 @@
     } catch (e) { /* private browsing: ignore */ }
   }
 
+  const REQUIRED_ACTIONS = ['getBootstrap', 'getDashboard', 'listTransactions', 'addTransaction', 'importPreview', 'importCommit'];
+
+  function backendHas(action) {
+    if (isDemo() || !state.backend || !Array.isArray(state.backend.actions)) return true;
+    return state.backend.actions.indexOf(action) !== -1;
+  }
+
+  function outdatedMessage() {
+    const missing = REQUIRED_ACTIONS.filter(a => !backendHas(a));
+    return missing.length
+      ? `Your backend is an older version (missing: ${missing.join(', ')}). In Apps Script: Deploy → Manage deployments → ✏️ → Version: New version → Deploy.`
+      : '';
+  }
+
   async function ensureBoot() {
     if (state.boot) return;
+    if (!isDemo() && !state.backend) {
+      try { state.backend = await post({ action: 'ping' }); } catch (e) { /* older backends have no ping details */ }
+    }
     state.boot = await api('getBootstrap');
     const name = state.boot.settings.display_name || '';
     document.getElementById('sidebar-foot').textContent = `${name ? name + ' · ' : ''}${isDemo() ? 'demo mode' : 'connected'}`;
@@ -1190,10 +1211,12 @@
 
   function renderImport() {
     const accounts = state.boot.accounts.filter(a => a.is_active !== false);
+    const outdated = outdatedMessage();
     view.innerHTML = `
       <div class="page-head fade-in">
         <div><h1>Import 📥</h1><p>Bring in a bank or card statement. Nothing is saved until you check the preview.</p></div>
       </div>
+      ${outdated ? `<section class="card fade-in" style="border-color:var(--warn)"><h2>⚠️ Update needed</h2><p>${esc(outdated)}</p></section>` : ''}
 
       <div class="steps fade-in">
         <section class="card">
@@ -1539,8 +1562,9 @@
         <section class="card span-12">
           <h2>Connection</h2>
           <p>${isDemo()
-            ? '✨ <b>Demo mode.</b> You are seeing sample data. Nothing you enter here is saved. Step 6 connects your real Google Sheet behind a secure login.'
-            : '🔒 <b>Connected</b> to your Apps Script backend.'}</p>
+            ? '✨ <b>Demo mode.</b> You are seeing sample data. Nothing you enter here is saved.'
+            : `🔒 <b>Connected</b> to your Apps Script backend${state.backend && state.backend.version ? ' · version <b>' + esc(state.backend.version) + '</b>' : ''}.`}</p>
+          ${outdatedMessage() ? `<p class="note">⚠️ ${esc(outdatedMessage())}</p>` : ''}
           <p class="muted">To add or rename accounts, categories and budgets, edit the tabs in your Google Sheet. Changes show up here and in the Telegram bot automatically.</p>
           ${isDemo() ? '' : '<div class="actions" style="margin-top:14px"><button type="button" class="btn ghost" id="sign-out">Sign out</button></div>'}
         </section>
